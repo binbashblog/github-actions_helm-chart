@@ -1,0 +1,170 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  KUBECTL: "1.24.1"
+  RABBITMQ: "3.13.6-alpine-3.20.2-management"
+  POSTGRES: "15.12-alpine-3.21.3-patroni-4.0.5"
+  SCRIPT: "ubi8_20240821"
+  IBMMQ_TAG: "ibmcom-mq-9.2.4.0-r1"
+  KAFKA_TAG: "3.5.0"
+  KAFDROP: "3.31.0"
+  PROXY: "2.6.9-ubi-8"
+  NGINX: "1.26.3.1-ubi8"
+  PGWEB_TAG: "0.11.10-ubi-8"
+  MEMCACHED: "1.6.31-ubi-8"
+  APP: "no"
+  PGWEB: "no"
+  IBMMQ: "no"
+  KAFKA: "no"
+  TABLEAU: "no"
+  DOCKER_TLS_CERTDIR: ""
+
+jobs:
+  docker-copy:
+    name: Copy Docker Images to ECR
+    runs-on: ubuntu-latest
+    if: github.ref != 'refs/heads/main'
+    environment: development
+    permissions:
+      id-token: write
+      contents: read
+    container:
+      image: docker:24.0.5
+      options: --privileged
+    services:
+      docker:
+        image: docker:24.0.5-dind
+        options: --privileged
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apk add --no-cache bash aws-cli jq curl
+
+      - name: Wait for Docker
+        run: |
+          echo "Waiting for Docker to be ready..."
+          timeout 30 sh -c 'until curl -s http://docker:2375/_ping | grep -q OK; do sleep 1; done'
+
+      - name: Copy images
+        run: |
+          bash scripts/copy-images.sh
+        env:
+          ROLE_NAME: gitlab-runner-role
+          REGION1: eu-west-1
+          REGION2: eu-west-2
+          ACCOUNT1_ID: ${{ secrets.ACCOUNT1_ID }}
+          ACCOUNT2_ID: ${{ secrets.ACCOUNT2_ID }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+
+  lint:
+    name: Helm Lint
+    runs-on: ubuntu-latest
+    needs: [docker-copy]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Helm Lint
+        run: helm lint ./helm-chart
+
+  deploy:
+    name: Deploy Helm Chart
+    runs-on: ubuntu-latest
+    needs: [lint]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download chart artifact
+        run: curl -sLO "https://nexus.example.com/repository/artifacts/helm-charts/artifact.zip"
+      - name: Helm Upgrade
+        run: |
+          RELEASE=${GITHUB_REF##*/}
+          SUFFIX=$(echo "$RELEASE" | sed 's/\.//g')
+          NAMESPACE="$SUFFIX"
+          INGRESS="${NAMESPACE}.example.com"
+          helm upgrade "$NAMESPACE" ./helm-chart \
+            --install \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            --atomic \
+            --timeout 30m \
+            --set appVersion="$RELEASE" \
+            --set version="$RELEASE" \
+            --set release="$RELEASE" \
+            --set generic.container.tag="$RELEASE" \
+            --set postgres.container.tag="${POSTGRES}" \
+            --set postgres.pgbackrest.container.tag="${KUBECTL}" \
+            --set rabbitmq.container.tag="${RABBITMQ}" \
+            --set ibmmq.container.tag="${IBMMQ_TAG}" \
+            --set kafka.container.tag="${KAFKA_TAG}" \
+            --set kafdrop.container.tag="${KAFDROP}" \
+            --set ui.container.tag="$RELEASE" \
+            --set api.container.tag="$RELEASE" \
+            --set monitors.container.tag="$RELEASE" \
+            --set proxy.container.tag="${PROXY}" \
+            --set cli.ref_data_load.container.tag="${KUBECTL}" \
+            --set nginx.container.tag="${NGINX}" \
+            --set ui.container.tag="$RELEASE" \
+            --set generator.container.tag="${RELEASE}_dev" \
+            --set pgweb.container.tag="${PGWEB_TAG}" \
+            --set memcached.container.tag="${MEMCACHED}" \
+            --set generator.enabled="${LOAD_GENERATOR}" \
+            --set use_app="${APP}" \
+            --set use_pgweb="${PGWEB}" \
+            --set use_int_ibmmq="${IBMMQ}" \
+            --set use_int_kafka="${KAFKA}" \
+            --set use_int_tableau="${TABLEAU}" \
+            --set ibmmq.ingress.hostname="ibmmq.${INGRESS}" \
+            --set kafdrop.ingress.hostname="kafdrop.${INGRESS}"
+
+  uninstall:
+    name: Helm Uninstall
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: [deploy]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl
+        run: |
+          VERSION=$(curl -sL https://dl.k8s.io/release/stable.txt)
+          curl -LO "https://dl.k8s.io/release/${VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+      - name: Helm Uninstall
+        run: |
+          SUFFIX=$(echo "${GITHUB_REF##*/}" | sed 's/\.//g')
+          NAMESPACE="$SUFFIX"
+          helm uninstall "$NAMESPACE" --namespace "$NAMESPACE" || true
+          kubectl delete namespace "$NAMESPACE" --ignore-not-found
+
+  package:
+    name: Package Chart
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zip openssl
+      - name: Package Helm Chart
+        run: |
+          RELEASE=${GITHUB_REF##*/}
+          SUFFIX=$(echo "$RELEASE" | sed 's/\.//g')
+          ZIP_PASSWORD=$(openssl rand -base64 12)
+          echo "$ZIP_PASSWORD" > zip_password.txt
+          find helm-chart -type f ! -name '*.gitignore' | zip -@ -P "$ZIP_PASSWORD" "helm-chart-$SUFFIX.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-package
+          path: |
+            helm-chart-*.zip
+            zip_password.txt
+          retention-days: 7
